@@ -1,6 +1,8 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { exec } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -15,7 +17,7 @@ const COMMAND_TIMEOUT_MS = parseInt(process.env.COMMAND_TIMEOUT_MS || "30000", 1
 
 if (!AUTH_TOKEN) {
   console.warn(
-    "[WARN] MCP_AUTH_TOKEN n'est pas défini — l'outil terminal sera accessible par quiconque trouve cette URL. " +
+    "[WARN] MCP_AUTH_TOKEN n'est pas défini ── l'outil terminal sera accessible par quiconque trouve cette URL. " +
       "Définis MCP_AUTH_TOKEN sur Render avant toute utilisation sérieuse."
   );
 }
@@ -30,13 +32,15 @@ function requireGithub() {
 }
 
 function buildServer() {
-  const server = new McpServer({ name: "chap-libre-toolkit", version: "1.0.0" });
+  const server = new McpServer({ name: "chap-libre-toolkit", version: "2.0.0" });
 
-  // ---------------- Terminal ----------------
+  // ---------------------------------------------------------------------------
+  // 1. TERMINAL & SYSTEM
+  // ---------------------------------------------------------------------------
   server.tool(
     "run_command",
     "Exécute une commande shell sur le serveur hébergeant cet outil MCP et retourne stdout/stderr. " +
-      "À utiliser avec prudence : la commande s'exécute avec les permissions du process serveur.",
+      "⚠️  utiliser avec prudence : la commande s'exécute avec les permissions du process serveur.",
     {
       command: z.string().describe("Commande shell à exécuter"),
       cwd: z.string().optional().describe("Répertoire de travail (par défaut /app)"),
@@ -67,15 +71,88 @@ function buildServer() {
     }
   );
 
-  // ---------------- GitHub ----------------
+  // ---------------------------------------------------------------------------
+  // 2. LOCAL FILE SYSTEM
+  // ---------------------------------------------------------------------------
+  server.tool(
+    "fs_list_directory",
+    "Liste le contenu d'un répertoire local sur le serveur.",
+    { dirPath: z.string().describe("Chemin du répertoire") },
+    async ({ dirPath }) => {
+      const entries = await fs.readdir(dirPath, { withFileTypes: true });
+      const result = entries
+        .map((e) => `${e.isDirectory() ? "[DIR]" : "[FILE]"} ${e.name}`)
+        .join("\n");
+      return { content: [{ type: "text", text: result }] };
+    }
+  );
+
+  server.tool(
+    "fs_read_file",
+    "Lit un fichier local sur le serveur.",
+    { filePath: z.string().describe("Chemin du fichier") },
+    async ({ filePath }) => {
+      const content = await fs.readFile(filePath, "utf-8");
+      return { content: [{ type: "text", text: content }] };
+    }
+  );
+
+  server.tool(
+    "fs_write_file",
+    "Écrit ou met à jour un fichier local sur le serveur.",
+    { filePath: z.string().describe("Chemin du fichier"), content: z.string().describe("Contenu") },
+    async ({ filePath, content }) => {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, content, "utf-8");
+      return { content: [{ type: "text", text: `Fichier écrit avec succès : ${filePath}` }] };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // 3. HTTP UTILITIES
+  // ---------------------------------------------------------------------------
+  server.tool(
+    "http_request",
+    "Effectue une requête HTTP vers une API externe.",
+    {
+      url: z.string().describe("URL cible"),
+      method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).default("GET"),
+      headers: z.record(z.string()).optional().describe("En-têtes HTTP additionnels"),
+      body: z.string().optional().describe("Corps de la requête (JSON stringifié ou texte)"),
+    },
+    async ({ url, method, headers, body }) => {
+      const options = {
+        method,
+        headers: headers || {},
+      };
+      if (body && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+        options.body = body;
+      }
+      const response = await fetch(url, options);
+      const text = await response.text();
+      return {
+        content: [{ type: "text", text: `Status: ${response.status} ${response.statusText}\n\n${text}` }],
+        isError: !response.ok,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // 4. GITHUB ENHANCED
+  // ---------------------------------------------------------------------------
   server.tool(
     "github_list_repos",
     "Liste les dépôts du compte GitHub authentifié.",
     { per_page: z.number().min(1).max(100).optional() },
     async ({ per_page }) => {
       const gh = requireGithub();
-      const { data } = await gh.repos.listForAuthenticatedUser({ per_page: per_page || 30, sort: "updated" });
-      const text = data.map((r) => `${r.full_name} — ${r.private ? "privé" : "public"} — ${r.html_url}`).join("\n");
+      const { data } = await gh.repos.listForAuthenticatedUser({
+        per_page: per_page || 30,
+        sort: "updated",
+      });
+      const text = data
+        .map((r) => `${r.full_name} ── ${r.private ? "privé" : "public"} ── ${r.html_url}`)
+        .join("\n");
       return { content: [{ type: "text", text: text || "Aucun dépôt trouvé." }] };
     }
   );
@@ -93,7 +170,9 @@ function buildServer() {
       const gh = requireGithub();
       const { data } = await gh.repos.getContent({ owner, repo, path, ref });
       if (Array.isArray(data)) {
-        return { content: [{ type: "text", text: data.map((d) => `${d.type}\t${d.path}`).join("\n") }] };
+        return {
+          content: [{ type: "text", text: data.map((d) => `${d.type}\t${d.path}`).join("\n") }],
+        };
       }
       const content = Buffer.from(data.content, data.encoding).toString("utf-8");
       return { content: [{ type: "text", text: content }] };
@@ -102,7 +181,7 @@ function buildServer() {
 
   server.tool(
     "github_create_or_update_file",
-    "Crée ou met à jour un fichier dans un dépôt GitHub (un seul fichier, un seul commit).",
+    "Crée ou met à jour un fichier dans un dépôt GitHub.",
     {
       owner: z.string(),
       repo: z.string(),
@@ -118,7 +197,7 @@ function buildServer() {
         const { data } = await gh.repos.getContent({ owner, repo, path, ref: branch });
         if (!Array.isArray(data)) sha = data.sha;
       } catch (e) {
-        // le fichier n'existe pas encore, c'est normal
+        // Le fichier n'existe pas encore
       }
       const { data } = await gh.repos.createOrUpdateFileContents({
         owner,
@@ -129,7 +208,7 @@ function buildServer() {
         content: Buffer.from(content, "utf-8").toString("base64"),
         sha,
       });
-      return { content: [{ type: "text", text: `Commité ${path} (${data.commit.sha})` }] };
+      return { content: [{ type: "text", text: `Committé ${path} (${data.commit.sha})` }] };
     }
   );
 
@@ -144,7 +223,9 @@ function buildServer() {
     async ({ owner, repo, state }) => {
       const gh = requireGithub();
       const { data } = await gh.issues.listForRepo({ owner, repo, state: state || "open" });
-      const text = data.map((i) => `#${i.number} ${i.title} (${i.state})`).join("\n");
+      const text = data
+        .map((i) => `#${i.number} ${i.title} (${i.state})`)
+        .join("\n");
       return { content: [{ type: "text", text: text || "Aucune issue trouvée." }] };
     }
   );
@@ -166,6 +247,112 @@ function buildServer() {
   );
 
   server.tool(
+    "github_add_issue_comment",
+    "Ajoute un commentaire sur une issue ou PR GitHub.",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      issue_number: z.number(),
+      body: z.string(),
+    },
+    async ({ owner, repo, issue_number, body }) => {
+      const gh = requireGithub();
+      const { data } = await gh.issues.createComment({ owner, repo, issue_number, body });
+      return { content: [{ type: "text", text: `Commentaire ajouté : ${data.html_url}` }] };
+    }
+  );
+
+  server.tool(
+    "github_list_pull_requests",
+    "Liste les Pull Requests d'un dépôt GitHub.",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      state: z.enum(["open", "closed", "all"]).optional(),
+    },
+    async ({ owner, repo, state }) => {
+      const gh = requireGithub();
+      const { data } = await gh.pulls.list({ owner, repo, state: state || "open" });
+      const text = data
+        .map((pr) => `PR #${pr.number} - ${pr.title} (${pr.state}) [${pr.html_url}]`)
+        .join("\n");
+      return { content: [{ type: "text", text: text || "Aucune PR trouvée." }] };
+    }
+  );
+
+  server.tool(
+    "github_get_pull_request",
+    "Affiche les détails d'une Pull Request.",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+    },
+    async ({ owner, repo, pull_number }) => {
+      const gh = requireGithub();
+      const { data } = await gh.pulls.get({ owner, repo, pull_number });
+      const info = [
+        `PR #${data.number}: ${data.title}`,
+        `Statut: ${data.state} | Merged: ${data.merged}`,
+        `Auteur: ${data.user?.login}`,
+        `Branche: ${data.head.ref} -> ${data.base.ref}`,
+        `URL: ${data.html_url}`,
+        `\nDescription:\n${data.body || "Aucune description"}`,
+      ].join("\n");
+      return { content: [{ type: "text", text: info }] };
+    }
+  );
+
+  server.tool(
+    "github_create_pull_request",
+    "Crée une nouvelle Pull Request.",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      title: z.string(),
+      head: z.string().describe("Branche source"),
+      base: z.string().describe("Branche cible (ex: main)"),
+      body: z.string().optional(),
+    },
+    async ({ owner, repo, title, head, base, body }) => {
+      const gh = requireGithub();
+      const { data } = await gh.pulls.create({ owner, repo, title, head, base, body });
+      return { content: [{ type: "text", text: `PR créée #${data.number} : ${data.html_url}` }] };
+    }
+  );
+
+  server.tool(
+    "github_merge_pull_request",
+    "Fusionne une Pull Request.",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+      commit_title: z.string().optional(),
+    },
+    async ({ owner, repo, pull_number, commit_title }) => {
+      const gh = requireGithub();
+      const { data } = await gh.pulls.merge({ owner, repo, pull_number, commit_title });
+      return { content: [{ type: "text", text: `PR #${pull_number} fusionnée avec succès (${data.sha})` }] };
+    }
+  );
+
+  server.tool(
+    "github_list_branches",
+    "Liste les branches d'un dépôt GitHub.",
+    {
+      owner: z.string(),
+      repo: z.string(),
+    },
+    async ({ owner, repo }) => {
+      const gh = requireGithub();
+      const { data } = await gh.repos.listBranches({ owner, repo });
+      const text = data.map((b) => `${b.name} (${b.commit.sha})`).join("\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  server.tool(
     "github_search_code",
     "Recherche du code sur GitHub.",
     { query: z.string() },
@@ -183,7 +370,7 @@ function buildServer() {
 const app = express();
 app.use(express.json());
 
-// Auth par jeton Bearer (protège notamment l'outil terminal)
+// Auth par jeton Bearer
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
   if (!AUTH_TOKEN) return next();
@@ -240,5 +427,5 @@ app.delete("/mcp", handleSessionRequest);
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 app.listen(PORT, () => {
-  console.log(`Serveur MCP (terminal + GitHub) à l'écoute sur le port ${PORT}`);
+  console.log(`Serveur MCP ultra-complet à l'écoute sur le port ${PORT}`);
 });
