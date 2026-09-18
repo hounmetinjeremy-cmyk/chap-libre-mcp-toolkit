@@ -172,6 +172,114 @@ function buildServer(req) {
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ---------------- OAuth pour la connexion MCP (LibreChat "Détection automatique") ----------------
+import { createHash, randomBytes } from "node:crypto";
+
+const oauthClients = {}; // client_id -> { redirect_uris }
+const authCodes = {}; // code -> { client_id, redirect_uri, code_challenge, expires }
+
+function base64url(buf) {
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// 1. Métadonnées du serveur d'autorisation, permet à LibreChat de détecter automatiquement OAuth
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  res.json({
+    issuer: BASE_URL,
+    authorization_endpoint: `${BASE_URL}/authorize`,
+    token_endpoint: `${BASE_URL}/token`,
+    registration_endpoint: `${BASE_URL}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+  });
+});
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  res.json({
+    resource: `${BASE_URL}/mcp`,
+    authorization_servers: [BASE_URL],
+  });
+});
+
+// 2. Enregistrement dynamique du client (RFC 7591) — LibreChat s'enregistre tout seul
+app.post("/register", (req, res) => {
+  const clientId = randomUUID();
+  const redirectUris = req.body?.redirect_uris || [];
+  oauthClients[clientId] = { redirectUris };
+  res.status(201).json({
+    client_id: clientId,
+    redirect_uris: redirectUris,
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+  });
+});
+
+// 3. Page d'autorisation — un seul bouton "Approuver", comme sur le serveur MCP GitHub de démo
+app.get("/authorize", (req, res) => {
+  const { client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.query;
+  res.send(`
+    <html>
+      <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+        <h2>Chap Libre MCP Toolkit</h2>
+        <p>LibreChat demande à se connecter à ton serveur MCP (terminal, outils GitHub).</p>
+        <form method="POST" action="/authorize">
+          <input type="hidden" name="client_id" value="${client_id || ""}">
+          <input type="hidden" name="redirect_uri" value="${redirect_uri || ""}">
+          <input type="hidden" name="state" value="${state || ""}">
+          <input type="hidden" name="code_challenge" value="${code_challenge || ""}">
+          <input type="hidden" name="code_challenge_method" value="${code_challenge_method || ""}">
+          <button type="submit" style="background:#242938;color:white;padding:12px 24px;border:none;border-radius:6px;font-weight:bold;font-size:16px;">Approuver</button>
+        </form>
+      </body>
+    </html>
+  `);
+});
+
+app.post("/authorize", (req, res) => {
+  const { client_id, redirect_uri, state, code_challenge } = req.body;
+  const code = randomUUID();
+  authCodes[code] = {
+    clientId: client_id,
+    redirectUri: redirect_uri,
+    codeChallenge: code_challenge,
+    expires: Date.now() + 5 * 60 * 1000,
+  };
+  const url = new URL(redirect_uri);
+  url.searchParams.set("code", code);
+  if (state) url.searchParams.set("state", state);
+  res.redirect(url.toString());
+});
+
+// 4. Échange du code contre un jeton d'accès — le jeton émis est le MCP_AUTH_TOKEN du serveur
+app.post("/token", (req, res) => {
+  const { grant_type, code, code_verifier, refresh_token } = req.body;
+
+  if (grant_type === "refresh_token") {
+    return res.json({ access_token: AUTH_TOKEN, token_type: "Bearer", expires_in: 31536000, refresh_token: refresh_token || randomUUID() });
+  }
+
+  const entry = authCodes[code];
+  if (!entry || entry.expires < Date.now()) {
+    return res.status(400).json({ error: "invalid_grant" });
+  }
+  if (entry.codeChallenge) {
+    const computed = base64url(createHash("sha256").update(code_verifier || "").digest());
+    if (computed !== entry.codeChallenge) {
+      return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
+    }
+  }
+  delete authCodes[code];
+  res.json({
+    access_token: AUTH_TOKEN,
+    token_type: "Bearer",
+    expires_in: 31536000,
+    refresh_token: randomUUID(),
+  });
+});
 
 // Page de connexion OAuth
 app.get("/login", (req, res) => {
