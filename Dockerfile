@@ -29,4 +29,5 @@ COPY . .
 ENV NODE_ENV=production
 EXPOSE 8080
 
-CMD ["node", "server.js"]
+# guard.mjs sécurise /authorize, /token et /mcp avant le démarrage de server.js
+CMD ["node", "--import", "./guard.mjs", "server.js"]
