@@ -11,39 +11,42 @@ import { Octokit } from "@octokit/rest";
 
 const PORT = process.env.PORT || 8080;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // Fallback token global si besoin
+
+// OAuth GitHub Config
+const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
+const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
+const BASE_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+
 const MAX_OUTPUT_CHARS = 20000;
 const COMMAND_TIMEOUT_MS = parseInt(process.env.COMMAND_TIMEOUT_MS || "30000", 10);
 
-if (!AUTH_TOKEN) {
-  console.warn(
-    "[WARN] MCP_AUTH_TOKEN n'est pas défini ── l'outil terminal sera accessible par quiconque trouve cette URL. " +
-      "Définis MCP_AUTH_TOKEN sur Render avant toute utilisation sérieuse."
-  );
-}
+// Stockage en mémoire des tokens par session utilisateur OAuth { sessionId: token }
+const userTokens = {};
 
-const octokit = GITHUB_TOKEN ? new Octokit({ auth: GITHUB_TOKEN }) : null;
-
-function requireGithub() {
-  if (!octokit) {
-    throw new Error("GITHUB_TOKEN n'est pas configuré sur ce serveur.");
+function getOctokit(req) {
+  // 1. Chercher un token OAuth lié à la session
+  const sessionId = req?.headers?.["mcp-session-id"];
+  if (sessionId && userTokens[sessionId]) {
+    return new Octokit({ auth: userTokens[sessionId] });
   }
-  return octokit;
+  // 2. Fallback sur le token global configuré sur Render
+  if (GITHUB_TOKEN) {
+    return new Octokit({ auth: GITHUB_TOKEN });
+  }
+  throw new Error("Non authentifié via GitHub. Veuillez vous connecter sur /login pour autoriser l'application.");
 }
 
-function buildServer() {
-  const server = new McpServer({ name: "chap-libre-toolkit", version: "2.0.0" });
+function buildServer(req) {
+  const server = new McpServer({ name: "chap-libre-toolkit", version: "2.1.0" });
 
-  // ---------------------------------------------------------------------------
-  // 1. TERMINAL & SYSTEM
-  // ---------------------------------------------------------------------------
+  // --- TERMINAL & SYSTEM ---
   server.tool(
     "run_command",
-    "Exécute une commande shell sur le serveur hébergeant cet outil MCP et retourne stdout/stderr. " +
-      "⚠️  utiliser avec prudence : la commande s'exécute avec les permissions du process serveur.",
+    "Exécute une commande shell sur le serveur.",
     {
       command: z.string().describe("Commande shell à exécuter"),
-      cwd: z.string().optional().describe("Répertoire de travail (par défaut /app)"),
+      cwd: z.string().optional().describe("Répertoire de travail"),
     },
     async ({ command, cwd }) => {
       return new Promise((resolve) => {
@@ -53,316 +56,116 @@ function buildServer() {
           (error, stdout, stderr) => {
             const out = (stdout || "").slice(0, MAX_OUTPUT_CHARS);
             const err = (stderr || "").slice(0, MAX_OUTPUT_CHARS);
-            const text = [
-              `$ ${command}`,
-              out ? `--- stdout ---\n${out}` : null,
-              err ? `--- stderr ---\n${err}` : null,
-              error ? `--- error ---\n${error.message}` : null,
-            ]
-              .filter(Boolean)
-              .join("\n\n");
-            resolve({
-              content: [{ type: "text", text: text || "(aucune sortie)" }],
-              isError: Boolean(error),
-            });
+            const text = [`$ ${command}`, out ? `--- stdout ---\n${out}` : null, err ? `--- stderr ---\n${err}` : null].filter(Boolean).join("\n\n");
+            resolve({ content: [{ type: "text", text: text || "(aucune sortie)" }], isError: Boolean(error) });
           }
         );
       });
     }
   );
 
-  // ---------------------------------------------------------------------------
-  // 2. LOCAL FILE SYSTEM
-  // ---------------------------------------------------------------------------
-  server.tool(
-    "fs_list_directory",
-    "Liste le contenu d'un répertoire local sur le serveur.",
-    { dirPath: z.string().describe("Chemin du répertoire") },
-    async ({ dirPath }) => {
-      const entries = await fs.readdir(dirPath, { withFileTypes: true });
-      const result = entries
-        .map((e) => `${e.isDirectory() ? "[DIR]" : "[FILE]"} ${e.name}`)
-        .join("\n");
-      return { content: [{ type: "text", text: result }] };
-    }
-  );
+  // --- LOCAL FILE SYSTEM & HTTP ---
+  server.tool("fs_list_directory", "Liste un répertoire local.", { dirPath: z.string() }, async ({ dirPath }) => {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    return { content: [{ type: "text", text: entries.map(e => `${e.isDirectory() ? "[DIR]" : "[FILE]"} ${e.name}`).join("\n") }] };
+  });
 
-  server.tool(
-    "fs_read_file",
-    "Lit un fichier local sur le serveur.",
-    { filePath: z.string().describe("Chemin du fichier") },
-    async ({ filePath }) => {
-      const content = await fs.readFile(filePath, "utf-8");
-      return { content: [{ type: "text", text: content }] };
-    }
-  );
+  server.tool("fs_read_file", "Lit un fichier local.", { filePath: z.string() }, async ({ filePath }) => {
+    const content = await fs.readFile(filePath, "utf-8");
+    return { content: [{ type: "text", text: content }] };
+  });
 
-  server.tool(
-    "fs_write_file",
-    "Écrit ou met à jour un fichier local sur le serveur.",
-    { filePath: z.string().describe("Chemin du fichier"), content: z.string().describe("Contenu") },
-    async ({ filePath, content }) => {
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, content, "utf-8");
-      return { content: [{ type: "text", text: `Fichier écrit avec succès : ${filePath}` }] };
-    }
-  );
+  server.tool("fs_write_file", "Écrit un fichier local.", { filePath: z.string(), content: z.string() }, async ({ filePath, content }) => {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, content, "utf-8");
+    return { content: [{ type: "text", text: `Écrit : ${filePath}` }] };
+  });
 
-  // ---------------------------------------------------------------------------
-  // 3. HTTP UTILITIES
-  // ---------------------------------------------------------------------------
-  server.tool(
-    "http_request",
-    "Effectue une requête HTTP vers une API externe.",
-    {
-      url: z.string().describe("URL cible"),
-      method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).default("GET"),
-      headers: z.record(z.string()).optional().describe("En-têtes HTTP additionnels"),
-      body: z.string().optional().describe("Corps de la requête (JSON stringifié ou texte)"),
-    },
-    async ({ url, method, headers, body }) => {
-      const options = {
-        method,
-        headers: headers || {},
-      };
-      if (body && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
-        options.body = body;
-      }
-      const response = await fetch(url, options);
-      const text = await response.text();
-      return {
-        content: [{ type: "text", text: `Status: ${response.status} ${response.statusText}\n\n${text}` }],
-        isError: !response.ok,
-      };
-    }
-  );
+  server.tool("http_request", "Requête HTTP externe.", { url: z.string(), method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).default("GET"), headers: z.record(z.string()).optional(), body: z.string().optional() }, async ({ url, method, headers, body }) => {
+    const res = await fetch(url, { method, headers: headers || {}, body: body && ["POST", "PUT", "PATCH", "DELETE"].includes(method) ? body : undefined });
+    const text = await res.text();
+    return { content: [{ type: "text", text: `Status: ${res.status}\n\n${text}` }], isError: !res.ok };
+  });
 
-  // ---------------------------------------------------------------------------
-  // 4. GITHUB ENHANCED
-  // ---------------------------------------------------------------------------
-  server.tool(
-    "github_list_repos",
-    "Liste les dépôts du compte GitHub authentifié.",
-    { per_page: z.number().min(1).max(100).optional() },
-    async ({ per_page }) => {
-      const gh = requireGithub();
-      const { data } = await gh.repos.listForAuthenticatedUser({
-        per_page: per_page || 30,
-        sort: "updated",
-      });
-      const text = data
-        .map((r) => `${r.full_name} ── ${r.private ? "privé" : "public"} ── ${r.html_url}`)
-        .join("\n");
-      return { content: [{ type: "text", text: text || "Aucun dépôt trouvé." }] };
-    }
-  );
+  // --- GITHUB TOOLS (Dynamiques selon l'utilisateur connecté) ---
+  server.tool("github_list_repos", "Liste les dépôts GitHub de l'utilisateur connecté.", { per_page: z.number().optional() }, async ({ per_page }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.repos.listForAuthenticatedUser({ per_page: per_page || 30, sort: "updated" });
+    const text = data.map(r => `${r.full_name} ── ${r.private ? "privé" : "public"} ── ${r.html_url}`).join("\n");
+    return { content: [{ type: "text", text: text || "Aucun dépôt." }] };
+  });
 
-  server.tool(
-    "github_get_file",
-    "Lit le contenu d'un fichier dans un dépôt GitHub.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-      path: z.string(),
-      ref: z.string().optional(),
-    },
-    async ({ owner, repo, path, ref }) => {
-      const gh = requireGithub();
-      const { data } = await gh.repos.getContent({ owner, repo, path, ref });
-      if (Array.isArray(data)) {
-        return {
-          content: [{ type: "text", text: data.map((d) => `${d.type}\t${d.path}`).join("\n") }],
-        };
-      }
-      const content = Buffer.from(data.content, data.encoding).toString("utf-8");
-      return { content: [{ type: "text", text: content }] };
-    }
-  );
+  server.tool("github_get_file", "Lit un fichier GitHub.", { owner: z.string(), repo: z.string(), path: z.string(), ref: z.string().optional() }, async ({ owner, repo, path, ref }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.repos.getContent({ owner, repo, path, ref });
+    if (Array.isArray(data)) return { content: [{ type: "text", text: data.map(d => `${d.type}\t${d.path}`).join("\n") }] };
+    return { content: [{ type: "text", text: Buffer.from(data.content, data.encoding).toString("utf-8") }] };
+  });
 
-  server.tool(
-    "github_create_or_update_file",
-    "Crée ou met à jour un fichier dans un dépôt GitHub.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-      path: z.string(),
-      content: z.string(),
-      message: z.string(),
-      branch: z.string().optional(),
-    },
-    async ({ owner, repo, path, content, message, branch }) => {
-      const gh = requireGithub();
-      let sha;
-      try {
-        const { data } = await gh.repos.getContent({ owner, repo, path, ref: branch });
-        if (!Array.isArray(data)) sha = data.sha;
-      } catch (e) {
-        // Le fichier n'existe pas encore
-      }
-      const { data } = await gh.repos.createOrUpdateFileContents({
-        owner,
-        repo,
-        path,
-        message,
-        branch,
-        content: Buffer.from(content, "utf-8").toString("base64"),
-        sha,
-      });
-      return { content: [{ type: "text", text: `Committé ${path} (${data.commit.sha})` }] };
-    }
-  );
+  server.tool("github_create_or_update_file", "Crée ou met à jour un fichier GitHub.", { owner: z.string(), repo: z.string(), path: z.string(), content: z.string(), message: z.string(), branch: z.string().optional() }, async ({ owner, repo, path, content, message, branch }) => {
+    const gh = getOctokit(req);
+    let sha;
+    try {
+      const { data } = await gh.repos.getContent({ owner, repo, path, ref: branch });
+      if (!Array.isArray(data)) sha = data.sha;
+    } catch (e) {}
+    const { data } = await gh.repos.createOrUpdateFileContents({ owner, repo, path, message, branch, content: Buffer.from(content, "utf-8").toString("base64"), sha });
+    return { content: [{ type: "text", text: `Committé ${path} (${data.commit.sha})` }] };
+  });
 
-  server.tool(
-    "github_list_issues",
-    "Liste les issues d'un dépôt GitHub.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-      state: z.enum(["open", "closed", "all"]).optional(),
-    },
-    async ({ owner, repo, state }) => {
-      const gh = requireGithub();
-      const { data } = await gh.issues.listForRepo({ owner, repo, state: state || "open" });
-      const text = data
-        .map((i) => `#${i.number} ${i.title} (${i.state})`)
-        .join("\n");
-      return { content: [{ type: "text", text: text || "Aucune issue trouvée." }] };
-    }
-  );
+  server.tool("github_list_issues", "Liste les issues.", { owner: z.string(), repo: z.string(), state: z.enum(["open", "closed", "all"]).optional() }, async ({ owner, repo, state }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.issues.listForRepo({ owner, repo, state: state || "open" });
+    return { content: [{ type: "text", text: data.map(i => `#${i.number} ${i.title} (${i.state})`).join("\n") || "Aucune issue." }] };
+  });
 
-  server.tool(
-    "github_create_issue",
-    "Crée une nouvelle issue dans un dépôt GitHub.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-      title: z.string(),
-      body: z.string().optional(),
-    },
-    async ({ owner, repo, title, body }) => {
-      const gh = requireGithub();
-      const { data } = await gh.issues.create({ owner, repo, title, body });
-      return { content: [{ type: "text", text: `Issue créée #${data.number}: ${data.html_url}` }] };
-    }
-  );
+  server.tool("github_create_issue", "Crée une issue.", { owner: z.string(), repo: z.string(), title: z.string(), body: z.string().optional() }, async ({ owner, repo, title, body }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.issues.create({ owner, repo, title, body });
+    return { content: [{ type: "text", text: `Issue créée #${data.number}: ${data.html_url}` }] };
+  });
 
-  server.tool(
-    "github_add_issue_comment",
-    "Ajoute un commentaire sur une issue ou PR GitHub.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-      issue_number: z.number(),
-      body: z.string(),
-    },
-    async ({ owner, repo, issue_number, body }) => {
-      const gh = requireGithub();
-      const { data } = await gh.issues.createComment({ owner, repo, issue_number, body });
-      return { content: [{ type: "text", text: `Commentaire ajouté : ${data.html_url}` }] };
-    }
-  );
+  server.tool("github_add_issue_comment", "Commente une issue/PR.", { owner: z.string(), repo: z.string(), issue_number: z.number(), body: z.string() }, async ({ owner, repo, issue_number, body }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.issues.createComment({ owner, repo, issue_number, body });
+    return { content: [{ type: "text", text: `Commentaire ajouté : ${data.html_url}` }] };
+  });
 
-  server.tool(
-    "github_list_pull_requests",
-    "Liste les Pull Requests d'un dépôt GitHub.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-      state: z.enum(["open", "closed", "all"]).optional(),
-    },
-    async ({ owner, repo, state }) => {
-      const gh = requireGithub();
-      const { data } = await gh.pulls.list({ owner, repo, state: state || "open" });
-      const text = data
-        .map((pr) => `PR #${pr.number} - ${pr.title} (${pr.state}) [${pr.html_url}]`)
-        .join("\n");
-      return { content: [{ type: "text", text: text || "Aucune PR trouvée." }] };
-    }
-  );
+  server.tool("github_list_pull_requests", "Liste les PRs.", { owner: z.string(), repo: z.string(), state: z.enum(["open", "closed", "all"]).optional() }, async ({ owner, repo, state }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.pulls.list({ owner, repo, state: state || "open" });
+    return { content: [{ type: "text", text: data.map(pr => `PR #${pr.number} - ${pr.title} (${pr.state})`).join("\n") || "Aucune PR." }] };
+  });
 
-  server.tool(
-    "github_get_pull_request",
-    "Affiche les détails d'une Pull Request.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-      pull_number: z.number(),
-    },
-    async ({ owner, repo, pull_number }) => {
-      const gh = requireGithub();
-      const { data } = await gh.pulls.get({ owner, repo, pull_number });
-      const info = [
-        `PR #${data.number}: ${data.title}`,
-        `Statut: ${data.state} | Merged: ${data.merged}`,
-        `Auteur: ${data.user?.login}`,
-        `Branche: ${data.head.ref} -> ${data.base.ref}`,
-        `URL: ${data.html_url}`,
-        `\nDescription:\n${data.body || "Aucune description"}`,
-      ].join("\n");
-      return { content: [{ type: "text", text: info }] };
-    }
-  );
+  server.tool("github_get_pull_request", "Détails d'une PR.", { owner: z.string(), repo: z.string(), pull_number: z.number() }, async ({ owner, repo, pull_number }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.pulls.get({ owner, repo, pull_number });
+    return { content: [{ type: "text", text: `PR #${data.number}: ${data.title}\nStatut: ${data.state}\nURL: ${data.html_url}\n\n${data.body || ""}` }] };
+  });
 
-  server.tool(
-    "github_create_pull_request",
-    "Crée une nouvelle Pull Request.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-      title: z.string(),
-      head: z.string().describe("Branche source"),
-      base: z.string().describe("Branche cible (ex: main)"),
-      body: z.string().optional(),
-    },
-    async ({ owner, repo, title, head, base, body }) => {
-      const gh = requireGithub();
-      const { data } = await gh.pulls.create({ owner, repo, title, head, base, body });
-      return { content: [{ type: "text", text: `PR créée #${data.number} : ${data.html_url}` }] };
-    }
-  );
+  server.tool("github_create_pull_request", "Crée une PR.", { owner: z.string(), repo: z.string(), title: z.string(), head: z.string(), base: z.string(), body: z.string().optional() }, async ({ owner, repo, title, head, base, body }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.pulls.create({ owner, repo, title, head, base, body });
+    return { content: [{ type: "text", text: `PR #${data.number} créée : ${data.html_url}` }] };
+  });
 
-  server.tool(
-    "github_merge_pull_request",
-    "Fusionne une Pull Request.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-      pull_number: z.number(),
-      commit_title: z.string().optional(),
-    },
-    async ({ owner, repo, pull_number, commit_title }) => {
-      const gh = requireGithub();
-      const { data } = await gh.pulls.merge({ owner, repo, pull_number, commit_title });
-      return { content: [{ type: "text", text: `PR #${pull_number} fusionnée avec succès (${data.sha})` }] };
-    }
-  );
+  server.tool("github_merge_pull_request", "Merge une PR.", { owner: z.string(), repo: z.string(), pull_number: z.number(), commit_title: z.string().optional() }, async ({ owner, repo, pull_number, commit_title }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.pulls.merge({ owner, repo, pull_number, commit_title });
+    return { content: [{ type: "text", text: `PR #${pull_number} mergée (${data.sha})` }] };
+  });
 
-  server.tool(
-    "github_list_branches",
-    "Liste les branches d'un dépôt GitHub.",
-    {
-      owner: z.string(),
-      repo: z.string(),
-    },
-    async ({ owner, repo }) => {
-      const gh = requireGithub();
-      const { data } = await gh.repos.listBranches({ owner, repo });
-      const text = data.map((b) => `${b.name} (${b.commit.sha})`).join("\n");
-      return { content: [{ type: "text", text }] };
-    }
-  );
+  server.tool("github_list_branches", "Liste les branches.", { owner: z.string(), repo: z.string() }, async ({ owner, repo }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.repos.listBranches({ owner, repo });
+    return { content: [{ type: "text", text: data.map(b => b.name).join("\n") }] };
+  });
 
-  server.tool(
-    "github_search_code",
-    "Recherche du code sur GitHub.",
-    { query: z.string() },
-    async ({ query }) => {
-      const gh = requireGithub();
-      const { data } = await gh.search.code({ q: query });
-      const text = data.items.map((i) => `${i.repository.full_name}: ${i.path}`).join("\n");
-      return { content: [{ type: "text", text: text || "Aucun résultat." }] };
-    }
-  );
+  server.tool("github_search_code", "Recherche du code.", { query: z.string() }, async ({ query }) => {
+    const gh = getOctokit(req);
+    const { data } = await gh.search.code({ q: query });
+    return { content: [{ type: "text", text: data.items.map(i => `${i.repository.full_name}: ${i.path}`).join("\n") || "Aucun résultat." }] };
+  });
 
   return server;
 }
@@ -370,9 +173,68 @@ function buildServer() {
 const app = express();
 app.use(express.json());
 
-// Auth par jeton Bearer
+// Page de connexion OAuth
+app.get("/login", (req, res) => {
+  if (!GITHUB_CLIENT_ID) {
+    return res.send("<h1>Erreur</h1><p>GITHUB_CLIENT_ID n'est pas configuré sur le serveur Render.</p>");
+  }
+  const redirectUri = `${BASE_URL}/auth/callback`;
+  const githubAuthUrl = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=repo,issues`;
+  res.send(`
+    <html>
+      <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+        <h2>Connexion à Chap Libre MCP Toolkit</h2>
+        <p>Cliquez ci-dessous pour autoriser l'accès à votre compte GitHub en un clic :</p>
+        <a href="${githubAuthUrl}" style="background: #24292e; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">Se connecter avec GitHub</a>
+      </body>
+    </html>
+  `);
+});
+
+// Callback OAuth GitHub
+app.get("/auth/callback", async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Code d'autorisation manquant.");
+
+  try {
+    const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "json" },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code,
+      }),
+    });
+    const tokenData = await tokenRes.json();
+    const accessToken = tokenData.access_token;
+
+    if (!accessToken) {
+      return res.status(400).send(`Erreur GitHub OAuth: ${JSON.stringify(tokenData)}`);
+    }
+
+    // Générer un identifiant de session unique pour l'utilisateur connecté
+    const userSessionId = randomUUID();
+    userTokens[userSessionId] = accessToken;
+
+    res.send(`
+      <html>
+        <body style="font-family: sans-serif; text-align: center; padding-top: 50px; color: green;">
+          <h2>Connexion réussie ! 🎉</h2>
+          <p>Votre compte GitHub a été autorisé avec succès.</p>
+          <p>Votre ID de session temporaire : <b>${userSessionId}</b></p>
+          <p>Vous pouvez fermer cette fenêtre et utiliser votre outil MCP.</p>
+        </body>
+      </html>
+    `);
+  } catch (err) {
+    res.status(500).send(`Erreur serveur : ${err.message}`);
+  }
+});
+
+// Middleware d'authentification Bearer pour l'API MCP
 app.use((req, res, next) => {
-  if (req.path === "/health") return next();
+  if (req.path === "/health" || req.path === "/login" || req.path === "/auth/callback") return next();
   if (!AUTH_TOKEN) return next();
   const header = req.headers["authorization"] || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -400,7 +262,7 @@ app.post("/mcp", async (req, res) => {
     transport.onclose = () => {
       if (transport.sessionId) delete transports[transport.sessionId];
     };
-    const server = buildServer();
+    const server = buildServer(req);
     await server.connect(transport);
   } else {
     return res.status(400).json({
@@ -423,9 +285,8 @@ async function handleSessionRequest(req, res) {
 
 app.get("/mcp", handleSessionRequest);
 app.delete("/mcp", handleSessionRequest);
-
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 app.listen(PORT, () => {
-  console.log(`Serveur MCP ultra-complet à l'écoute sur le port ${PORT}`);
+  console.log(`Serveur MCP OAuth prêt sur le port ${PORT}`);
 });
