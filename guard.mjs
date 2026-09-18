@@ -138,7 +138,7 @@ ${error ? `<p style="color:#b00020">${esc(error)}</p>` : ""}
       return pass();
     }
 
-    if (path === "/mcp") {
+    if (path === "/mcp" || path === "/everything" || path.startsWith("/everything/")) {
       const h = req.headers.authorization || "";
       if (!(h.startsWith("Bearer ") && same(h.slice(7), TOKEN))) {
         return send(res, 401, "application/json", JSON.stringify({ error: "Unauthorized" }), {

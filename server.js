@@ -395,6 +395,42 @@ app.get("/mcp", handleSessionRequest);
 app.delete("/mcp", handleSessionRequest);
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
+// ===== Serveur MCP "everything" integre (port interne 3100, proxifie sur /everything) =====
+import http from "node:http";
+import { spawn } from "node:child_process";
+
+const EV_PORT = process.env.EVERYTHING_PORT || "3100";
+const evProc = spawn(process.execPath, ["everything/dist/index.js", "streamableHttp"], {
+  env: { ...process.env, PORT: EV_PORT },
+  stdio: "inherit",
+});
+evProc.on("exit", (code) => {
+  console.error("everything arrete, code", code);
+  process.exit(code ?? 1);
+});
+
+app.use("/everything", (req, res) => {
+  const preq = http.request(
+    {
+      host: "127.0.0.1",
+      port: EV_PORT,
+      method: req.method,
+      path: req.url || "/",
+      headers: { ...req.headers, host: "127.0.0.1:" + EV_PORT },
+    },
+    (pres) => {
+      res.writeHead(pres.statusCode || 502, pres.headers);
+      pres.pipe(res);
+    }
+  );
+  preq.on("error", (e) => {
+    console.error("proxy everything erreur:", e.message);
+    if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "everything indisponible" }));
+  });
+  req.pipe(preq);
+});
+
 app.listen(PORT, () => {
   console.log(`Serveur MCP OAuth prêt sur le port ${PORT}`);
 });
