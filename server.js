@@ -13,6 +13,7 @@ import { Octokit } from "@octokit/rest";
 const PORT = process.env.PORT || 8080;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // Fallback token global si besoin
+const RENDER_API_KEY = process.env.RENDER_API_KEY; // Cle API Render (compte) pour heberger des projets
 
 // OAuth GitHub Config
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
@@ -36,6 +37,20 @@ function getOctokit(req) {
     return new Octokit({ auth: GITHUB_TOKEN });
   }
   throw new Error("Non authentifié via GitHub. Veuillez vous connecter sur /login pour autoriser l'application.");
+}
+
+
+async function renderRequest(method, path, body) {
+  if (!RENDER_API_KEY) throw new Error("RENDER_API_KEY non configure sur ce serveur.");
+  const res = await fetch(`https://api.render.com/v1${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${RENDER_API_KEY}`, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json; try { json = JSON.parse(text); } catch { json = text; }
+  if (!res.ok) throw new Error(`Render API ${res.status}: ${JSON.stringify(json)}`);
+  return json;
 }
 
 function buildServer(req) {
@@ -175,6 +190,67 @@ function buildServer(req) {
     const gh = getOctokit(req);
     const { data } = await gh.search.code({ q: query });
     return { content: [{ type: "text", text: data.items.map(i => `${i.repository.full_name}: ${i.path}`).join("\n") || "Aucun résultat." }] };
+  });
+
+
+  // --- RENDER TOOLS (heberger et gerer des projets) ---
+  server.tool("render_list_services", "Liste les services Render (web services, workers, etc.) du compte.", {}, async () => {
+    const data = await renderRequest("GET", "/services?limit=50");
+    const text = data.map(s => `${s.service.name} (${s.service.type}) - ${s.service.id} - ${s.service.serviceDetails?.url || ""}`).join("\n");
+    return { content: [{ type: "text", text: text || "Aucun service." }] };
+  });
+
+  server.tool("render_get_service", "Details d'un service Render par ID.", { serviceId: z.string() }, async ({ serviceId }) => {
+    const data = await renderRequest("GET", `/services/${serviceId}`);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  });
+
+  server.tool("render_create_web_service", "Cree un nouveau service web Render a partir d'un depot GitHub public ou connecte.", {
+    name: z.string(),
+    repo: z.string().describe("URL du depot GitHub, ex: https://github.com/owner/repo"),
+    branch: z.string().optional().default("main"),
+    runtime: z.enum(["node", "docker", "python", "ruby", "go", "rust", "static"]).default("docker"),
+    plan: z.enum(["free", "starter", "standard", "pro"]).default("free"),
+    region: z.string().optional().default("oregon"),
+    buildCommand: z.string().optional(),
+    startCommand: z.string().optional(),
+    ownerId: z.string().describe("ID du workspace/owner Render (ex: tea-xxxx), obtenu via render_list_services ou le dashboard."),
+  }, async ({ name, repo, branch, runtime, plan, region, buildCommand, startCommand, ownerId }) => {
+    const body = {
+      type: "web_service",
+      name,
+      ownerId,
+      repo,
+      branch,
+      autoDeploy: "yes",
+      serviceDetails: {
+        env: runtime,
+        plan,
+        region,
+        envSpecificDetails: runtime === "docker" ? {} : { buildCommand: buildCommand || "", startCommand: startCommand || "" },
+      },
+    };
+    const data = await renderRequest("POST", "/services", body);
+    return { content: [{ type: "text", text: `Service cree: ${data.service?.name} (${data.service?.id})\nURL: ${data.service?.serviceDetails?.url || "en cours"}` }] };
+  });
+
+  server.tool("render_update_env_vars", "Met a jour les variables d'environnement d'un service Render (redeploiement automatique).", {
+    serviceId: z.string(),
+    envVars: z.array(z.object({ key: z.string(), value: z.string() })),
+  }, async ({ serviceId, envVars }) => {
+    const data = await renderRequest("PUT", `/services/${serviceId}/env-vars`, envVars);
+    return { content: [{ type: "text", text: `Variables mises a jour (${data.length || envVars.length}). Redeploiement declenche.` }] };
+  });
+
+  server.tool("render_list_deploys", "Liste les deploiements recents d'un service.", { serviceId: z.string(), limit: z.number().optional().default(5) }, async ({ serviceId, limit }) => {
+    const data = await renderRequest("GET", `/services/${serviceId}/deploys?limit=${limit}`);
+    const text = data.map(d => `${d.deploy.id} - ${d.deploy.status} - ${d.deploy.createdAt}`).join("\n");
+    return { content: [{ type: "text", text: text || "Aucun deploiement." }] };
+  });
+
+  server.tool("render_trigger_deploy", "Declenche un nouveau deploiement pour un service (dernier commit de la branche).", { serviceId: z.string(), clearCache: z.boolean().optional().default(false) }, async ({ serviceId, clearCache }) => {
+    const data = await renderRequest("POST", `/services/${serviceId}/deploys`, { clearCache: clearCache ? "clear" : "do_not_clear" });
+    return { content: [{ type: "text", text: `Deploiement declenche: ${data.id} - statut: ${data.status}` }] };
   });
 
   return server;
