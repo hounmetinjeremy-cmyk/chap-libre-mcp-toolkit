@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { exec } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -43,24 +44,33 @@ function buildServer(req) {
   // --- TERMINAL & SYSTEM ---
   server.tool(
     "run_command",
-    "Exécute une commande shell sur le serveur.",
+    "Exécute une commande shell dans un dossier temporaire isolé, automatiquement supprimé après exécution (sauf si 'cwd' est précisé).",
     {
       command: z.string().describe("Commande shell à exécuter"),
-      cwd: z.string().optional().describe("Répertoire de travail"),
+      cwd: z.string().optional().describe("Répertoire de travail. Si omis, un dossier temporaire jetable est utilisé puis effacé."),
     },
     async ({ command, cwd }) => {
-      return new Promise((resolve) => {
-        exec(
-          command,
-          { cwd: cwd || process.cwd(), timeout: COMMAND_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
-          (error, stdout, stderr) => {
-            const out = (stdout || "").slice(0, MAX_OUTPUT_CHARS);
-            const err = (stderr || "").slice(0, MAX_OUTPUT_CHARS);
-            const text = [`$ ${command}`, out ? `--- stdout ---\n${out}` : null, err ? `--- stderr ---\n${err}` : null].filter(Boolean).join("\n\n");
-            resolve({ content: [{ type: "text", text: text || "(aucune sortie)" }], isError: Boolean(error) });
-          }
-        );
-      });
+      const useTempDir = !cwd;
+      const workDir = cwd || path.join(os.tmpdir(), `run-${randomUUID()}`);
+      if (useTempDir) await fs.mkdir(workDir, { recursive: true });
+      try {
+        return await new Promise((resolve) => {
+          exec(
+            command,
+            { cwd: workDir, timeout: COMMAND_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
+            (error, stdout, stderr) => {
+              const out = (stdout || "").slice(0, MAX_OUTPUT_CHARS);
+              const err = (stderr || "").slice(0, MAX_OUTPUT_CHARS);
+              const text = [`$ ${command}`, out ? `--- stdout ---\n${out}` : null, err ? `--- stderr ---\n${err}` : null].filter(Boolean).join("\n\n");
+              resolve({ content: [{ type: "text", text: text || "(aucune sortie)" }], isError: Boolean(error) });
+            }
+          );
+        });
+      } finally {
+        if (useTempDir) {
+          await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+        }
+      }
     }
   );
 
